@@ -65,6 +65,7 @@ import de.robv.android.xposed.XposedBridge
 import de.robv.android.xposed.XposedHelpers
 import de.robv.android.xposed.callbacks.XC_LoadPackage.LoadPackageParam
 import io.github.neonorbit.dexplore.DexFactory
+import io.github.neonorbit.dexplore.DexOptions
 import io.github.neonorbit.dexplore.Dexplore
 import io.github.neonorbit.dexplore.ReferencePool
 import io.github.neonorbit.dexplore.filter.ClassFilter
@@ -83,8 +84,11 @@ import org.json.JSONException
 import org.json.JSONObject
 import java.io.File
 import java.lang.ref.WeakReference
+import java.lang.reflect.Method
 import java.lang.reflect.Modifier
 import java.util.UUID
+import java.util.concurrent.Executors
+import java.util.concurrent.Future
 import kotlin.system.exitProcess
 
 
@@ -285,7 +289,9 @@ class Xposed: IXposedHookLoadPackage {
             SigBypass.doSigBypass(this, lpparam.classLoader)
         }
         sharedPreferences = getSharedPreferences(SHARED_PREFS_NAME, Context.MODE_PRIVATE)
-        dexplore = DexFactory.load(lpparam.appInfo.sourceDir)
+        val dexOptions = DexOptions()
+        dexOptions.enableCache = true
+        dexplore = DexFactory.load(lpparam.appInfo.sourceDir, dexOptions)
         packageInfo = packageManager.getPackageInfo(packageName, 0)
         val requiresSetup = !sharedPreferences.areAllKeysPresent(packageInfo.longVersionCode)
         if(requiresSetup && isMainProcess) {
@@ -1060,6 +1066,14 @@ class Xposed: IXposedHookLoadPackage {
      *  shared prefs for each version, and loaded if it exists already.
      */
     private fun LoadPackageParam.hookSystemInfo(context: Context) {
+//        XposedBridge.log("begin hookSystemInfo")
+//        val cls0: Class<*> = Class.forName("com.samsung.android.oneconnect.base.systeminfo.a", true, classLoader)
+//        val savedMethod = cls0.getMethod("e")
+//        XposedBridge.log("begin hookSystemInfo 1")
+//        val cls: Class<*> = Class.forName("j60.a", true, classLoader)
+//        val savedMethodAlt = cls.getMethod("a")
+//        val methods = arrayListOf(savedMethod, savedMethodAlt)
+//        XposedBridge.log("begin hookSystemInfo $savedMethod $savedMethodAlt")
         val savedMethod = getSavedMethod(SharedPrefsKey.SHARED_PREF_KEY_SYSTEM_INFO_METHOD)
         val savedMethodAlt = getSavedMethod(SharedPrefsKey.SHARED_PREF_KEY_SYSTEM_INFO_METHOD_ALT)
         val methods = if(savedMethod == null) {
@@ -1085,10 +1099,12 @@ class Xposed: IXposedHookLoadPackage {
         }else{
             listOfNotNull(savedMethod, savedMethodAlt)
         }.mapNotNull { it.loadMethod(classLoader) }
+        XposedBridge.log("end hookSystemInfo")
         if(methods.isEmpty()) {
             context.logException("uTag: Failed to hook SystemInfo (${packageInfo.versionName}, ${BuildConfig.XPOSED_CODE})")
             return
         }
+        XposedBridge.log("begin hookSystemInfo hook")
         methods.forEach {
             XposedBridge.hookMethod(
                 it,
@@ -1112,6 +1128,7 @@ class Xposed: IXposedHookLoadPackage {
                 }
             )
         }
+        XposedBridge.log("end hookSystemInfo hook")
     }
 
     /**
@@ -1149,6 +1166,8 @@ class Xposed: IXposedHookLoadPackage {
      *  killed as much as possible.
      */
     private fun LoadPackageParam.hookQcServiceRunnable(context: Context) {
+//        val cls0: Class<*> = Class.forName("com.samsung.android.oneconnect.manager.k0", true, classLoader)
+//        val method = cls0.getMethod("0")
         val savedMethod = getSavedMethod(SharedPrefsKey.SHARED_PREF_KEY_QCSERVICE_RUNNABLE_METHOD)
         val method = if(savedMethod == null) {
             val classFilter = ClassFilter.Builder()

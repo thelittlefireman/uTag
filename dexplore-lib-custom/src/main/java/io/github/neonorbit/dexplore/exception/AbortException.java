@@ -1,0 +1,42 @@
+/*
+ * Copyright (C) 2022 NeonOrbit
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package io.github.neonorbit.dexplore.exception;
+
+import io.github.neonorbit.dexplore.iface.Internal;
+
+@Internal
+public final class AbortException extends RuntimeException{
+  private final boolean silent;
+
+  private AbortException() {
+    super(null, null, false, false);
+    silent = true;
+  }
+
+  public AbortException(String msg) {
+    super(msg, null, false, false);
+    silent = false;
+  }
+
+  public boolean isSilent() {
+    return silent;
+  }
+
+  public static AbortException silently() {
+    return new AbortException();
+  }
+}

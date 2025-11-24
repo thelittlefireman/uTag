@@ -41,6 +41,7 @@ android {
 dependencies {
     compileOnly(libs.xposed)
     implementation(libs.play.services.location)
-    implementation(libs.dexplore)
+    //implementation(libs.dexplore)
     implementation(libs.androidx.core)
+    implementation(project(":dexplore-lib-custom"))
 }
