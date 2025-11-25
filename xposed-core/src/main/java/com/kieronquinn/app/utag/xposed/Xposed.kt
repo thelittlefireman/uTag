@@ -30,6 +30,7 @@ import android.os.IBinder.DeathRecipient
 import android.os.ParcelUuid
 import android.webkit.WebView
 import android.webkit.WebViewClient
+import androidx.core.content.edit
 import androidx.core.os.bundleOf
 import com.kieronquinn.app.utag.model.LocationStaleness
 import com.kieronquinn.app.utag.service.ILocationCallback
@@ -74,7 +75,9 @@ import io.github.neonorbit.dexplore.filter.MethodFilter
 import io.github.neonorbit.dexplore.filter.ReferenceTypes
 import io.github.neonorbit.dexplore.result.ClassData
 import io.github.neonorbit.dexplore.result.MethodData
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.DelicateCoroutinesApi
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.GlobalScope
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
@@ -84,7 +87,6 @@ import org.json.JSONException
 import org.json.JSONObject
 import java.io.File
 import java.lang.ref.WeakReference
-import java.lang.reflect.Method
 import java.lang.reflect.Modifier
 import java.util.UUID
 import java.util.concurrent.Executors
@@ -209,6 +211,7 @@ class Xposed: IXposedHookLoadPackage {
             SHARED_PREF_KEY_FIREBASE_PUSH_INTENT("firebase_push_intent"),
             SHARED_PREF_KEY_IS_FMM_SUPPORTED("is_fmm_supported"),
             SHARED_PREF_KEY_ALLOW_SCANNING("allow_scanning"),
+            SHARED_PREF_KEY_SETUP_COMPLETE_AT_LEAST_ONE_TIME("setup_at_least_one_time"),
             ;
 
             fun getKey(version: Long): String {
@@ -278,14 +281,14 @@ class Xposed: IXposedHookLoadPackage {
     private fun Context.handleLoadApplication(lpparam: LoadPackageParam) {
         val isStandalone = isStandaloneModule()
         val isMainProcess = Application.getProcessName() == PACKAGE_NAME_ONECONNECT
-        if(!isStandalone) {
+        if (!isStandalone) {
             //We have to go via the provider as the signature is spoofed
             val isModded = UTagXposedProvider_isSmartThingsModded(this)
-            if(isModded) {
+            if (isModded) {
                 XposedBridge.log("uTag is modded and hooked, aborting hooking! Disable the Xposed module or reinstall from Google Play to fix this.")
                 return
             }
-        }else{
+        } else {
             SigBypass.doSigBypass(this, lpparam.classLoader)
         }
         sharedPreferences = getSharedPreferences(SHARED_PREFS_NAME, Context.MODE_PRIVATE)
@@ -294,37 +297,87 @@ class Xposed: IXposedHookLoadPackage {
         dexplore = DexFactory.load(lpparam.appInfo.sourceDir, dexOptions)
         packageInfo = packageManager.getPackageInfo(packageName, 0)
         val requiresSetup = !sharedPreferences.areAllKeysPresent(packageInfo.longVersionCode)
-        if(requiresSetup && isMainProcess) {
+        if (requiresSetup && isMainProcess) {
             //Has to go via provider since it has a higher chance of having notification permission
             UTagXposedProvider_showSetupToast(this)
         }
-        hookViewMap()
-        hookActivity()
-        hookWebView()
-        deleteVmfDenylist()
-        lpparam.hookRootChecks()
-        lpparam.hookIsFmmSupported(this)
-        lpparam.hookStartScan()
-        lpparam.hookTagDozeModeService()
-        lpparam.hookCapsuleProvider()
-        lpparam.hookSystemInfo(this)
-        lpparam.hookQcServiceRunnable(this)
-        lpparam.hookPublishDeviceStatus(this)
-        lpparam.hookSmartTagGattConnecter(this)
-        lpparam.hookDeviceBleThingsManager(this)
-        lpparam.hookScanCallback(this)
-        lpparam.hookAllowScanning(this)
-        lpparam.hookDebug(this)
-        lpparam.hookCheckDisconnect(this)
-        lpparam.hookOneConnectPushNotifications(this)
-        lpparam.hookSamsungAccount()
-        lpparam.hookShortcutActivity()
-        lpparam.hookPlatformVersion()
-        if(requiresSetup) {
-            sendBroadcast(Intent(ACTION_HOOKING_FINISHED).apply {
-                applySecurity(this@handleLoadApplication)
-                `package` = PACKAGE_NAME_UTAG
-            })
+        val executor = Executors.newSingleThreadExecutor()
+        if (isStandalone && !sharedPreferences.getBoolean(
+                SharedPrefsKey.SHARED_PREF_KEY_SETUP_COMPLETE_AT_LEAST_ONE_TIME.getKey(
+                    packageInfo.longVersionCode
+                ), false
+            )
+        ) {
+            // Some OS have a more aggressive ANR policy (ex: grapheneos)
+            // ANR is due to dexplore searching process is the main Application class. To speed up hooking process and avoid ANR,
+            // First we run all dexplore searching process in a thread,
+            // adn then, when all dexplore searching process have been cached to shared preferences,
+            // kill the app and restart it to hook again but at startup without thread
+            val futures = mutableListOf<Future<out Any>>()
+            futures += executor.submit {
+                findMethodIsFmmSupported()
+                findMethodsSystemInfo()
+                findMethodQcServiceRunnable()
+                findMethodPublishDeviceStatus()
+                findMethodSmartTagGattConnecter()
+                findMethodDeviceBleThingsManagerScanNotify()
+                findMethodDeviceBleThingsManagerScanRepository()
+                findClassScanCallBack()
+                findMethodAllowScanning()
+                findClassDebug()
+                findMethodDisconnect()
+                findMethodForceDisconnect()
+                findMethodOneConnectPushNotifications()
+                // When the searching process is finish, set setup as completed and force kill the app.
+                // Next the app will restart and hook will be apply normally at startup
+                if (!sharedPreferences.getBoolean(
+                        SharedPrefsKey.SHARED_PREF_KEY_SETUP_COMPLETE_AT_LEAST_ONE_TIME.getKey(
+                            packageInfo.longVersionCode
+                        ), false
+                    )
+                ) {
+                    sharedPreferences.edit(commit = true) {
+                        putBoolean(
+                            SharedPrefsKey.SHARED_PREF_KEY_SETUP_COMPLETE_AT_LEAST_ONE_TIME.getKey(
+                                packageInfo.longVersionCode
+                            ), true
+                        )
+                    }
+                    CoroutineScope(Dispatchers.Main).launch {
+                        // Force kill
+                        exitProcess(-1)
+                    }
+                }
+            }
+        } else {
+            hookViewMap()
+            hookActivity()
+            hookWebView()
+            deleteVmfDenylist()
+            lpparam.hookRootChecks()
+            lpparam.hookIsFmmSupported(this)
+            lpparam.hookStartScan()
+            lpparam.hookTagDozeModeService()
+            lpparam.hookCapsuleProvider()
+            lpparam.hookSystemInfo(this)
+            lpparam.hookQcServiceRunnable(this)
+            lpparam.hookPublishDeviceStatus(this)
+            lpparam.hookSmartTagGattConnecter(this)
+            lpparam.hookDeviceBleThingsManager(this)
+            lpparam.hookScanCallback(this)
+            lpparam.hookAllowScanning(this)
+            lpparam.hookDebug(this)
+            lpparam.hookCheckDisconnect(this)
+            lpparam.hookOneConnectPushNotifications(this)
+            lpparam.hookSamsungAccount()
+            lpparam.hookShortcutActivity()
+            lpparam.hookPlatformVersion()
+            if (requiresSetup) {
+                sendBroadcast(Intent(ACTION_HOOKING_FINISHED).apply {
+                    applySecurity(this@handleLoadApplication)
+                    `package` = PACKAGE_NAME_UTAG
+                })
+            }
         }
     }
 
@@ -362,22 +415,26 @@ class Xposed: IXposedHookLoadPackage {
         )
     }
 
+    private fun findMethodOneConnectPushNotifications(): MethodData? = run{
+        val classFilter = ClassFilter.Builder()
+            .setClasses("com.google.firebase.messaging.FirebaseMessagingService")
+            .build()
+        val methodFilter = MethodFilter.Builder()
+            .setReferenceTypes(ReferenceTypes.STRINGS_ONLY)
+            .setReferenceFilter { pool: ReferencePool ->
+                pool.contains("FirebaseApp has not being initialized. Device might be in direct boot mode. Skip exporting delivery metrics to Big Query")
+            }
+            .setModifiers(Modifier.PUBLIC)
+            .build()
+        dexplore.findMethod(classFilter, methodFilter)?.also {
+            saveMethod(SharedPrefsKey.SHARED_PREF_KEY_FIREBASE_PUSH_INTENT, it)
+        }
+    }
+
     private fun LoadPackageParam.hookOneConnectPushNotifications(context: Context) {
         val savedMethod = getSavedMethod(SharedPrefsKey.SHARED_PREF_KEY_FIREBASE_PUSH_INTENT)
         val method = if(savedMethod == null) {
-            val classFilter = ClassFilter.Builder()
-                .setClasses("com.google.firebase.messaging.FirebaseMessagingService")
-                .build()
-            val methodFilter = MethodFilter.Builder()
-                .setReferenceTypes(ReferenceTypes.STRINGS_ONLY)
-                .setReferenceFilter { pool: ReferencePool ->
-                    pool.contains("FirebaseApp has not being initialized. Device might be in direct boot mode. Skip exporting delivery metrics to Big Query")
-                }
-                .setModifiers(Modifier.PUBLIC)
-                .build()
-            dexplore.findMethod(classFilter, methodFilter)?.also {
-                saveMethod(SharedPrefsKey.SHARED_PREF_KEY_FIREBASE_PUSH_INTENT, it)
-            }
+            findMethodOneConnectPushNotifications()
         }else{
             savedMethod
         }?.loadMethod(classLoader) ?: run {
@@ -682,6 +739,25 @@ class Xposed: IXposedHookLoadPackage {
         )
     }
 
+    private fun findMethodIsFmmSupported(): MethodData? = run {
+        val classFilter = ClassFilter.Builder()
+            .setReferenceTypes(ReferenceTypes.STRINGS_ONLY)
+            .setReferenceFilter { pool: ReferencePool ->
+                pool.contains("isSupportFindMyMobileFeature")
+            }
+            .build()
+        val methodFilter = MethodFilter.Builder()
+            .setReferenceTypes(ReferenceTypes.STRINGS_ONLY)
+            .setReferenceFilter { pool: ReferencePool ->
+                pool.contains("isSupportFindMyMobileFeature")
+            }
+            .setModifiers(Modifier.PUBLIC)
+            .build()
+        dexplore.findMethod(classFilter, methodFilter)?.also {
+            saveMethod(SharedPrefsKey.SHARED_PREF_KEY_IS_FMM_SUPPORTED, it)
+        }
+    }
+
     /**
      *  Replaces the ContentProvider call which checks for FMM support when a push notification is
      *  received with a fake call to our own provider which always returns true. This is the final
@@ -690,22 +766,7 @@ class Xposed: IXposedHookLoadPackage {
     private fun LoadPackageParam.hookIsFmmSupported(context: Context) {
         val savedMethod = getSavedMethod(SharedPrefsKey.SHARED_PREF_KEY_IS_FMM_SUPPORTED)
         val method = if(savedMethod == null) {
-            val classFilter = ClassFilter.Builder()
-                .setReferenceTypes(ReferenceTypes.STRINGS_ONLY)
-                .setReferenceFilter { pool: ReferencePool ->
-                    pool.contains("isSupportFindMyMobileFeature")
-                }
-                .build()
-            val methodFilter = MethodFilter.Builder()
-                .setReferenceTypes(ReferenceTypes.STRINGS_ONLY)
-                .setReferenceFilter { pool: ReferencePool ->
-                    pool.contains("isSupportFindMyMobileFeature")
-                }
-                .setModifiers(Modifier.PUBLIC)
-                .build()
-            dexplore.findMethod(classFilter, methodFilter)?.also {
-                saveMethod(SharedPrefsKey.SHARED_PREF_KEY_IS_FMM_SUPPORTED, it)
-            }
+            findMethodIsFmmSupported()
         }else{
             savedMethod
         }?.loadMethod(classLoader) ?: run {
@@ -1060,6 +1121,28 @@ class Xposed: IXposedHookLoadPackage {
         )
     }
 
+    private fun findMethodsSystemInfo(): List<MethodData> = run{
+        val dexFilter = DexFilter.Builder().build()
+        val classFilter = ClassFilter.Builder()
+            .setReferenceTypes(ReferenceTypes.STRINGS_ONLY)
+            .setReferenceFilter { pool: ReferencePool -> pool.contains("Nexus") }
+            .build()
+        val methodFilter = MethodFilter.Builder()
+            .setReferenceTypes(ReferenceTypes.STRINGS_ONLY)
+            .setReferenceFilter { pool: ReferencePool -> pool.contains("Nexus") }
+            .setParamSize(0)
+            .setModifiers(Modifier.PUBLIC)
+            .build()
+        val methods = dexplore.findMethods(dexFilter, classFilter, methodFilter, 2)
+        methods.getOrNull(0)?.let {
+            saveMethod(SharedPrefsKey.SHARED_PREF_KEY_SYSTEM_INFO_METHOD, it)
+        }
+        methods.getOrNull(1)?.let {
+            saveMethod(SharedPrefsKey.SHARED_PREF_KEY_SYSTEM_INFO_METHOD_ALT, it)
+        }
+        methods
+    }
+
     /**
      *  Uses Dexplore to find the SystemInfo class, and hook the method which does the
      *  manufacturer check. To save on searching, the method signature is committed to SmartThings'
@@ -1077,25 +1160,7 @@ class Xposed: IXposedHookLoadPackage {
         val savedMethod = getSavedMethod(SharedPrefsKey.SHARED_PREF_KEY_SYSTEM_INFO_METHOD)
         val savedMethodAlt = getSavedMethod(SharedPrefsKey.SHARED_PREF_KEY_SYSTEM_INFO_METHOD_ALT)
         val methods = if(savedMethod == null) {
-            val dexFilter = DexFilter.Builder().build()
-            val classFilter = ClassFilter.Builder()
-                .setReferenceTypes(ReferenceTypes.STRINGS_ONLY)
-                .setReferenceFilter { pool: ReferencePool -> pool.contains("Nexus") }
-                .build()
-            val methodFilter = MethodFilter.Builder()
-                .setReferenceTypes(ReferenceTypes.STRINGS_ONLY)
-                .setReferenceFilter { pool: ReferencePool -> pool.contains("Nexus") }
-                .setParamSize(0)
-                .setModifiers(Modifier.PUBLIC)
-                .build()
-            val methods = dexplore.findMethods(dexFilter, classFilter, methodFilter, 2)
-            methods.getOrNull(0)?.let {
-                saveMethod(SharedPrefsKey.SHARED_PREF_KEY_SYSTEM_INFO_METHOD, it)
-            }
-            methods.getOrNull(1)?.let {
-                saveMethod(SharedPrefsKey.SHARED_PREF_KEY_SYSTEM_INFO_METHOD_ALT, it)
-            }
-            methods
+            findMethodsSystemInfo()
         }else{
             listOfNotNull(savedMethod, savedMethodAlt)
         }.mapNotNull { it.loadMethod(classLoader) }
@@ -1131,6 +1196,16 @@ class Xposed: IXposedHookLoadPackage {
         XposedBridge.log("end hookSystemInfo hook")
     }
 
+    private fun findClassDebug(): ClassData? = run {
+        val classFilter = ClassFilter.Builder()
+            .setReferenceTypes(ReferenceTypes.STRINGS_ONLY)
+            .setReferenceFilter { pool: ReferencePool -> pool.contains("PRINT_SECURE_LOG : ") }
+            .build()
+        dexplore.findClass(classFilter)?.also {
+            saveClass(SharedPrefsKey.SHARED_PREF_KEY_DEBUG_CLASS, it)
+        }
+    }
+
     /**
      *  Uses Dexplore to find the Logger class, then sets the two debug boolean global fields to
      *  true when [BuildConfig.DEBUG] is set
@@ -1138,13 +1213,7 @@ class Xposed: IXposedHookLoadPackage {
     private fun LoadPackageParam.hookDebug(context: Context) {
         val savedClass = getSavedClass(SharedPrefsKey.SHARED_PREF_KEY_DEBUG_CLASS)
         val debugClass = if(savedClass == null) {
-            val classFilter = ClassFilter.Builder()
-                .setReferenceTypes(ReferenceTypes.STRINGS_ONLY)
-                .setReferenceFilter { pool: ReferencePool -> pool.contains("PRINT_SECURE_LOG : ") }
-                .build()
-            dexplore.findClass(classFilter)?.also {
-                saveClass(SharedPrefsKey.SHARED_PREF_KEY_DEBUG_CLASS, it)
-            }
+            findClassDebug()
         }else{
             savedClass
         }?.loadClass(classLoader) ?: run {
@@ -1160,6 +1229,26 @@ class Xposed: IXposedHookLoadPackage {
         }
     }
 
+    private fun findMethodQcServiceRunnable(): MethodData? = run {
+        val classFilter = ClassFilter.Builder()
+            .setReferenceTypes(ReferenceTypes.STRINGS_ONLY)
+            .setReferenceFilter { pool: ReferencePool ->
+                pool.contains(" isSyncAllProceeding:")
+            }
+            .build()
+        val methodFilter = MethodFilter.Builder()
+            .setReferenceTypes(ReferenceTypes.STRINGS_ONLY)
+            .setReferenceFilter { pool: ReferencePool ->
+                pool.contains(" isSyncAllProceeding:")
+            }
+            .setParamSize(0)
+            .setModifiers(Modifier.PUBLIC)
+            .build()
+        dexplore.findMethod(classFilter, methodFilter)?.also {
+            saveMethod(SharedPrefsKey.SHARED_PREF_KEY_QCSERVICE_RUNNABLE_METHOD, it)
+        }
+    }
+
     /**
      *  Uses Dexplore to find the QcService runnable class, and hook the method which checks for
      *  whether the service should be stopped, and neutralise it. We want to prevent ST from being
@@ -1170,23 +1259,7 @@ class Xposed: IXposedHookLoadPackage {
 //        val method = cls0.getMethod("0")
         val savedMethod = getSavedMethod(SharedPrefsKey.SHARED_PREF_KEY_QCSERVICE_RUNNABLE_METHOD)
         val method = if(savedMethod == null) {
-            val classFilter = ClassFilter.Builder()
-                .setReferenceTypes(ReferenceTypes.STRINGS_ONLY)
-                .setReferenceFilter { pool: ReferencePool ->
-                    pool.contains(" isSyncAllProceeding:")
-                }
-                .build()
-            val methodFilter = MethodFilter.Builder()
-                .setReferenceTypes(ReferenceTypes.STRINGS_ONLY)
-                .setReferenceFilter { pool: ReferencePool ->
-                    pool.contains(" isSyncAllProceeding:")
-                }
-                .setParamSize(0)
-                .setModifiers(Modifier.PUBLIC)
-                .build()
-            dexplore.findMethod(classFilter, methodFilter)?.also {
-                saveMethod(SharedPrefsKey.SHARED_PREF_KEY_QCSERVICE_RUNNABLE_METHOD, it)
-            }
+            findMethodQcServiceRunnable()
         }else{
             savedMethod
         }?.loadMethod(classLoader) ?: run {
@@ -1204,6 +1277,44 @@ class Xposed: IXposedHookLoadPackage {
         )
     }
 
+    private fun findMethodDisconnect(): MethodData? = run {
+        val classFilter = ClassFilter.Builder()
+            .setReferenceTypes(ReferenceTypes.STRINGS_ONLY)
+            .setReferenceFilter { pool: ReferencePool ->
+                pool.contains("] | Characteristics: [")
+            }
+            .build()
+        val methodFilter = MethodFilter.Builder()
+            .setReferenceTypes(ReferenceTypes.STRINGS_ONLY)
+            .setReferenceFilter { pool: ReferencePool ->
+                pool.contains("Disconnect non priority connections.")
+            }
+            .setModifiers(Modifier.PUBLIC)
+            .build()
+        dexplore.findMethod(classFilter, methodFilter)?.also {
+            saveMethod(SharedPrefsKey.SHARED_PREF_KEY_DISCONNECT_METHOD, it)
+        }
+    }
+
+    private fun findMethodForceDisconnect(): MethodData? = run {
+        val classFilter = ClassFilter.Builder()
+            .setReferenceTypes(ReferenceTypes.STRINGS_ONLY)
+            .setReferenceFilter { pool: ReferencePool ->
+                pool.contains("] | Characteristics: [")
+            }
+            .build()
+        val methodFilter = MethodFilter.Builder()
+            .setReferenceTypes(ReferenceTypes.STRINGS_ONLY)
+            .setReferenceFilter { pool: ReferencePool ->
+                pool.contains("forceDisconnect")
+            }
+            .setModifiers(Modifier.PUBLIC)
+            .build()
+        dexplore.findMethod(classFilter, methodFilter)?.also {
+            saveMethod(SharedPrefsKey.SHARED_PREF_KEY_FORCE_DISCONNECT_METHOD, it)
+        }
+    }
+
     /**
      *  Hooks calls to disconnect Tags and redirects them to force disconect, to actually disconnect
      *  them. SmartThings usually rejects disconnect calls due to priority connections, which we
@@ -1213,22 +1324,7 @@ class Xposed: IXposedHookLoadPackage {
     private fun LoadPackageParam.hookCheckDisconnect(context: Context) {
         val savedMethod = getSavedMethod(SharedPrefsKey.SHARED_PREF_KEY_DISCONNECT_METHOD)
         val method = if(savedMethod == null) {
-            val classFilter = ClassFilter.Builder()
-                .setReferenceTypes(ReferenceTypes.STRINGS_ONLY)
-                .setReferenceFilter { pool: ReferencePool ->
-                    pool.contains("] | Characteristics: [")
-                }
-                .build()
-            val methodFilter = MethodFilter.Builder()
-                .setReferenceTypes(ReferenceTypes.STRINGS_ONLY)
-                .setReferenceFilter { pool: ReferencePool ->
-                    pool.contains("Disconnect non priority connections.")
-                }
-                .setModifiers(Modifier.PUBLIC)
-                .build()
-            dexplore.findMethod(classFilter, methodFilter)?.also {
-                saveMethod(SharedPrefsKey.SHARED_PREF_KEY_DISCONNECT_METHOD, it)
-            }
+            findMethodDisconnect()
         }else{
             savedMethod
         }?.loadMethod(classLoader) ?: run {
@@ -1237,22 +1333,7 @@ class Xposed: IXposedHookLoadPackage {
         }
         val savedForceMethod = getSavedMethod(SharedPrefsKey.SHARED_PREF_KEY_FORCE_DISCONNECT_METHOD)
         val forceMethod = if(savedForceMethod == null) {
-            val classFilter = ClassFilter.Builder()
-                .setReferenceTypes(ReferenceTypes.STRINGS_ONLY)
-                .setReferenceFilter { pool: ReferencePool ->
-                    pool.contains("] | Characteristics: [")
-                }
-                .build()
-            val methodFilter = MethodFilter.Builder()
-                .setReferenceTypes(ReferenceTypes.STRINGS_ONLY)
-                .setReferenceFilter { pool: ReferencePool ->
-                    pool.contains("forceDisconnect")
-                }
-                .setModifiers(Modifier.PUBLIC)
-                .build()
-            dexplore.findMethod(classFilter, methodFilter)?.also {
-                saveMethod(SharedPrefsKey.SHARED_PREF_KEY_FORCE_DISCONNECT_METHOD, it)
-            }
+            findMethodForceDisconnect()
         }else{
             savedForceMethod
         }?.loadMethod(classLoader) ?: run {
@@ -1269,6 +1350,25 @@ class Xposed: IXposedHookLoadPackage {
         )
     }
 
+    private fun findMethodPublishDeviceStatus(): MethodData? = run{
+        val classFilter = ClassFilter.Builder()
+            .setReferenceTypes(ReferenceTypes.STRINGS_ONLY)
+            .setReferenceFilter { pool: ReferencePool ->
+                pool.contains("] | Characteristics: [")
+            }
+            .build()
+        val methodFilter = MethodFilter.Builder()
+            .setReferenceTypes(ReferenceTypes.STRINGS_ONLY)
+            .setReferenceFilter { pool: ReferencePool ->
+                pool.contains("publishDeviceStatus") && pool.contains("id is null.")
+            }
+            .setModifiers(Modifier.PUBLIC)
+            .build()
+        dexplore.findMethod(classFilter, methodFilter)?.also {
+            saveMethod(SharedPrefsKey.SHARED_PREF_KEY_PUBLISH_DEVICE_STATUS_METHOD, it)
+        }
+    }
+
     /**
      *  Uses Dexplore to find the GattActionManagerImpl.publishDeviceStatus method, which we
      *  use to intercept button presses as the service method does not work.
@@ -1276,22 +1376,7 @@ class Xposed: IXposedHookLoadPackage {
     private fun LoadPackageParam.hookPublishDeviceStatus(context: Context) {
         val savedMethod = getSavedMethod(SharedPrefsKey.SHARED_PREF_KEY_PUBLISH_DEVICE_STATUS_METHOD)
         val method = if(savedMethod == null) {
-            val classFilter = ClassFilter.Builder()
-                .setReferenceTypes(ReferenceTypes.STRINGS_ONLY)
-                .setReferenceFilter { pool: ReferencePool ->
-                    pool.contains("] | Characteristics: [")
-                }
-                .build()
-            val methodFilter = MethodFilter.Builder()
-                .setReferenceTypes(ReferenceTypes.STRINGS_ONLY)
-                .setReferenceFilter { pool: ReferencePool ->
-                    pool.contains("publishDeviceStatus") && pool.contains("id is null.")
-                }
-                .setModifiers(Modifier.PUBLIC)
-                .build()
-            dexplore.findMethod(classFilter, methodFilter)?.also {
-                saveMethod(SharedPrefsKey.SHARED_PREF_KEY_PUBLISH_DEVICE_STATUS_METHOD, it)
-            }
+            findMethodPublishDeviceStatus()
         }else{
             savedMethod
         }?.loadMethod(classLoader) ?: run {
@@ -1319,6 +1404,26 @@ class Xposed: IXposedHookLoadPackage {
         )
     }
 
+    private fun findMethodSmartTagGattConnecter(): MethodData? = run{
+        val classFilter = ClassFilter.Builder()
+            .setReferenceTypes(ReferenceTypes.STRINGS_ONLY)
+            .setReferenceFilter { pool: ReferencePool ->
+                pool.contains(" | uuidConnectionAvailable: ")
+            }
+            .build()
+        val methodFilter = MethodFilter.Builder()
+            .setReferenceTypes(ReferenceTypes.STRINGS_ONLY)
+            .setReferenceFilter { pool: ReferencePool ->
+                pool.contains(" | uuidConnectionAvailable: ")
+            }
+            .setModifiers(Modifier.PUBLIC)
+            .build()
+        dexplore.findMethod(classFilter, methodFilter)?.also {
+            saveMethod(SharedPrefsKey.SHARED_PREF_KEY_SMART_TAG_CONNECT_METHOD, it)
+        }
+    }
+
+
     /**
      *  Uses Dexplore to find the SmartTagGattConnecter.connect method, which we use to to
      *  intercept calls to connect to Tags and disable when Passive Mode is enabled
@@ -1326,22 +1431,7 @@ class Xposed: IXposedHookLoadPackage {
     private fun LoadPackageParam.hookSmartTagGattConnecter(context: Context) {
         val savedMethod = getSavedMethod(SharedPrefsKey.SHARED_PREF_KEY_SMART_TAG_CONNECT_METHOD)
         val method = if(savedMethod == null) {
-            val classFilter = ClassFilter.Builder()
-                .setReferenceTypes(ReferenceTypes.STRINGS_ONLY)
-                .setReferenceFilter { pool: ReferencePool ->
-                    pool.contains(" | uuidConnectionAvailable: ")
-                }
-                .build()
-            val methodFilter = MethodFilter.Builder()
-                .setReferenceTypes(ReferenceTypes.STRINGS_ONLY)
-                .setReferenceFilter { pool: ReferencePool ->
-                    pool.contains(" | uuidConnectionAvailable: ")
-                }
-                .setModifiers(Modifier.PUBLIC)
-                .build()
-            dexplore.findMethod(classFilter, methodFilter)?.also {
-                saveMethod(SharedPrefsKey.SHARED_PREF_KEY_SMART_TAG_CONNECT_METHOD, it)
-            }
+            findMethodSmartTagGattConnecter()
         }else{
             savedMethod
         }?.loadMethod(classLoader) ?: run {
@@ -1363,25 +1453,48 @@ class Xposed: IXposedHookLoadPackage {
         )
     }
 
-    private fun LoadPackageParam.hookDeviceBleThingsManager(context: Context) {
-        val savedNotifyMethod = getSavedMethod(SharedPrefsKey.SHARED_PREF_KEY_SCAN_NOTIFY_METHOD)
+    private fun findMethodDeviceBleThingsManagerScanNotify(): MethodData? = run {
         val classFilter = ClassFilter.Builder()
             .setReferenceTypes(ReferenceTypes.STRINGS_ONLY)
             .setReferenceFilter { pool: ReferencePool ->
                 pool.contains("updateDeviceBleThings:for in deviceTagConnectionCallbackHashMap")
             }
             .build()
-        val notifyMethod = if(savedNotifyMethod == null) {
-            val methodFilter = MethodFilter.Builder()
-                .setReferenceTypes(ReferenceTypes.STRINGS_ONLY)
-                .setReferenceFilter { pool: ReferencePool ->
-                    pool.contains("updateDeviceBleThings:for in deviceTagConnectionCallbackHashMap")
-                }
-                .setModifiers(Modifier.PUBLIC)
-                .build()
-            dexplore.findMethod(classFilter, methodFilter)?.also {
-                saveMethod(SharedPrefsKey.SHARED_PREF_KEY_SCAN_NOTIFY_METHOD, it)
+        val methodFilter = MethodFilter.Builder()
+            .setReferenceTypes(ReferenceTypes.STRINGS_ONLY)
+            .setReferenceFilter { pool: ReferencePool ->
+                pool.contains("updateDeviceBleThings:for in deviceTagConnectionCallbackHashMap")
             }
+            .setModifiers(Modifier.PUBLIC)
+            .build()
+        dexplore.findMethod(classFilter, methodFilter)?.also {
+            saveMethod(SharedPrefsKey.SHARED_PREF_KEY_SCAN_NOTIFY_METHOD, it)
+        }
+    }
+
+    private fun findMethodDeviceBleThingsManagerScanRepository(): MethodData? = run {
+        val classFilter = ClassFilter.Builder()
+            .setReferenceTypes(ReferenceTypes.STRINGS_ONLY)
+            .setReferenceFilter { pool: ReferencePool ->
+                pool.contains("updateDeviceBleThings:for in deviceTagConnectionCallbackHashMap")
+            }
+            .build()
+        val methodFilter = MethodFilter.Builder()
+            .setReferenceTypes(ReferenceTypes.STRINGS_ONLY)
+            .setReferenceFilter { pool: ReferencePool ->
+                pool.contains("smartTagRepository")
+            }
+            .setModifiers(Modifier.PUBLIC)
+            .build()
+        dexplore.findMethod(classFilter, methodFilter)?.also {
+            saveMethod(SharedPrefsKey.SHARED_PREF_KEY_SCAN_REPOSITORY_METHOD, it)
+        }
+    }
+
+    private fun LoadPackageParam.hookDeviceBleThingsManager(context: Context) {
+        val savedNotifyMethod = getSavedMethod(SharedPrefsKey.SHARED_PREF_KEY_SCAN_NOTIFY_METHOD)
+        val notifyMethod = if(savedNotifyMethod == null) {
+            findMethodDeviceBleThingsManagerScanNotify()
         }else{
             savedNotifyMethod
         }?.loadMethod(classLoader) ?: run {
@@ -1391,16 +1504,7 @@ class Xposed: IXposedHookLoadPackage {
         val savedRepositoryMethod =
             getSavedMethod(SharedPrefsKey.SHARED_PREF_KEY_SCAN_REPOSITORY_METHOD)
         val repositoryMethod = if(savedRepositoryMethod == null) {
-            val methodFilter = MethodFilter.Builder()
-                .setReferenceTypes(ReferenceTypes.STRINGS_ONLY)
-                .setReferenceFilter { pool: ReferencePool ->
-                    pool.contains("smartTagRepository")
-                }
-                .setModifiers(Modifier.PUBLIC)
-                .build()
-            dexplore.findMethod(classFilter, methodFilter)?.also {
-                saveMethod(SharedPrefsKey.SHARED_PREF_KEY_SCAN_REPOSITORY_METHOD, it)
-            }
+            findMethodDeviceBleThingsManagerScanRepository()
         }else{
             savedRepositoryMethod
         }?.loadMethod(classLoader) ?: run {
@@ -1453,19 +1557,23 @@ class Xposed: IXposedHookLoadPackage {
         )
     }
 
+    private fun findClassScanCallBack(): ClassData? = run {
+        val classFilter = ClassFilter.Builder()
+            .setReferenceTypes(ReferenceTypes.STRINGS_ONLY)
+            .setReferenceFilter { pool: ReferencePool -> pool.contains("Ignore  device is null") }
+            .build()
+        dexplore.findClass(classFilter)?.also {
+            saveClass(SharedPrefsKey.SHARED_PREF_KEY_SCAN_CALLBACK_CLASS, it)
+        }
+    }
+
     /**
      *  Uses Dexplore to find the ScanCallback class, to send all scan results to uTag
      */
     private fun LoadPackageParam.hookScanCallback(context: Context) {
         val savedClass = getSavedClass(SharedPrefsKey.SHARED_PREF_KEY_SCAN_CALLBACK_CLASS)
         val scanCallbackClass = if(savedClass == null) {
-            val classFilter = ClassFilter.Builder()
-                .setReferenceTypes(ReferenceTypes.STRINGS_ONLY)
-                .setReferenceFilter { pool: ReferencePool -> pool.contains("Ignore  device is null") }
-                .build()
-            dexplore.findClass(classFilter)?.also {
-                saveClass(SharedPrefsKey.SHARED_PREF_KEY_SCAN_CALLBACK_CLASS, it)
-            }
+            findClassScanCallBack()
         }else{
             savedClass
         }?.loadClass(classLoader) ?: run {
@@ -1493,29 +1601,33 @@ class Xposed: IXposedHookLoadPackage {
         )
     }
 
+    private fun findMethodAllowScanning(): MethodData? = run {
+        val classFilter = ClassFilter.Builder()
+            .setReferenceTypes(ReferenceTypes.STRINGS_ONLY)
+            .setReferenceFilter { pool: ReferencePool ->
+                pool.contains("one_connect_force_stop_discovery_app_background_test")
+            }
+            .build()
+        val methodFilter = MethodFilter.Builder()
+            .setReferenceTypes(ReferenceTypes.STRINGS_ONLY)
+            .setReferenceFilter { pool: ReferencePool ->
+                pool.contains("one_connect_force_stop_discovery_app_background_test") &&
+                        pool.contains("quick_connect_force_stop_discovery")
+            }
+            .setModifiers(Modifier.PUBLIC or Modifier.STATIC or Modifier.FINAL)
+            .build()
+        dexplore.findMethod(classFilter, methodFilter)?.also {
+            saveMethod(SharedPrefsKey.SHARED_PREF_KEY_ALLOW_SCANNING, it)
+        }
+    }
+
     /**
      *  Uses Dexplore to find the AllowScanning method, to always allow scanning
      */
     private fun LoadPackageParam.hookAllowScanning(context: Context) {
         val savedMethod = getSavedMethod(SharedPrefsKey.SHARED_PREF_KEY_ALLOW_SCANNING)
         val method = if(savedMethod == null) {
-            val classFilter = ClassFilter.Builder()
-                .setReferenceTypes(ReferenceTypes.STRINGS_ONLY)
-                .setReferenceFilter { pool: ReferencePool ->
-                    pool.contains("one_connect_force_stop_discovery_app_background_test")
-                }
-                .build()
-            val methodFilter = MethodFilter.Builder()
-                .setReferenceTypes(ReferenceTypes.STRINGS_ONLY)
-                .setReferenceFilter { pool: ReferencePool ->
-                    pool.contains("one_connect_force_stop_discovery_app_background_test") &&
-                            pool.contains("quick_connect_force_stop_discovery")
-                }
-                .setModifiers(Modifier.PUBLIC or Modifier.STATIC or Modifier.FINAL)
-                .build()
-            dexplore.findMethod(classFilter, methodFilter)?.also {
-                saveMethod(SharedPrefsKey.SHARED_PREF_KEY_ALLOW_SCANNING, it)
-            }
+            findMethodAllowScanning()
         }else{
             savedMethod
         }?.loadMethod(classLoader) ?: run {
@@ -1576,7 +1688,7 @@ class Xposed: IXposedHookLoadPackage {
         val result = classes[lspIndex + 1]
         return Triple(result.first, result.second, classList)
     }
-    
+
     private fun Context.logException(title: String, throwable: Throwable? = null) {
         XposedBridge.log(title)
         XposedCrashReportProvider_reportNonFatal(this, XposedException(title, throwable))
